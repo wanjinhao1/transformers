@@ -188,7 +188,6 @@ class BlockScaledCheckpointReaderTest(unittest.TestCase):
                 self.assertIsNone(read_compressed_tensors(checkpoint))
 
 
-
 class FineGrainedConfigGroupReaderTest(unittest.TestCase):
     def _groups(self, reverse=False, identical=False):
         nvfp4 = {"targets": ["Linear"], "weights": {"num_bits": 4, "type": "float", "group_size": 16}}
