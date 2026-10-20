@@ -29,10 +29,11 @@ class Fp8HfQuantizer(BlockScaledQuantizer):
     """Block and per-tensor FP8, with static or dynamic activations and scalar-scaled embedding tables."""
 
     quantization_config: "Fp8Config"
-    # Both names hold the dequantization multiplier, so `weight_scale` only needs a rename to `weight_scale_inv`
-    producer_layouts = dict.fromkeys(
-        ("compressed-tensors", "modelopt"), ProducerLayout(block_scale_name="weight_scale")
-    )
+    # Each name holds the dequantization multiplier, so it only needs a rename to `weight_scale_inv`
+    producer_layouts = {
+        **dict.fromkeys(("compressed-tensors", "modelopt"), ProducerLayout(block_scale_name="weight_scale")),
+        "deepseek": ProducerLayout(block_scale_name="scale"),
+    }
 
     def format_parallel_plan(self, model, plan):
         from ..distributed.tensor_parallel import _get_parameter_plan, replace_layer_number_by_wildcard
