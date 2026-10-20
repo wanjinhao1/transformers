@@ -18,6 +18,7 @@ its `dtype_plan` gives it.
 """
 
 import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..utils import (
@@ -28,10 +29,12 @@ from ..utils import (
     logging,
 )
 from ..utils.import_utils import KERNELS_MAX_VERSION, KERNELS_MIN_VERSION
+from ..utils.quantization_config import Fp8Config
 from .base import HfQuantizer
 from .quantizers_utils import (
     FUSED_STACKS,
     STACK_COMPANIONS,
+    embedding_pattern,
     get_module_from_name,
     replace_with_quantized_modules,
 )
@@ -50,6 +53,14 @@ logger = logging.get_logger(__name__)
 GATED_UP_PROJECTIONS = ("gate_up_proj",)
 
 
+@dataclass(frozen=True)
+class ProducerLayout:
+    """Checkpoint layout of one producer, where it differs from the slots the modules hold."""
+
+    # checkpoint name of the block scale when it is not `weight_scale_inv`, e.g. `weight_scale`
+    block_scale_name: str | None = None
+
+
 class BlockScaledQuantizer(HfQuantizer):
     """Base quantizer of a block-scaled format.
 
@@ -59,10 +70,21 @@ class BlockScaledQuantizer(HfQuantizer):
     requires_calibration = False
     dequantized_saves_unquantized = True
     quantization_config: "BlockScaledConfig | FineGrainedConfig"
+    # producer layout per `checkpoint_format`. Unlisted formats use the module slots as is.
+    producer_layouts: dict[str | None, ProducerLayout] = {}
+
+    def __init__(self, quantization_config, **kwargs):
+        super().__init__(quantization_config, **kwargs)
+        # embedding tables to quantize, by name suffix. Each holds FP8 rows with one per-tensor scale.
+        self.embeddings = list(getattr(quantization_config, "modules_to_convert", None) or [])
+        self._embedding_config = Fp8Config(weight_block_size=None)
+
+    def _embedding_plan(self) -> dict[str, "BlockScaledConfig"]:
+        return dict.fromkeys(map(embedding_pattern, self.embeddings), self._embedding_config)
 
     def plan(self) -> dict[str, "BlockScaledConfig"]:
-        """`{module regex: format config}` for the modules this quantizer covers."""
-        return {".*": self.quantization_config}
+        """Return `{module regex: format config}` for the modules this quantizer covers."""
+        return {**self._embedding_plan(), ".*": self.quantization_config}
 
     def members(self) -> list["BlockScaledQuantizer"]:
         """Return the quantizer of each format config in `plan()`."""
@@ -71,6 +93,13 @@ class BlockScaledQuantizer(HfQuantizer):
     def member_of(self, module) -> "BlockScaledQuantizer | None":
         """Return the quantizer whose plan entry `module` was built from, or `None` for an unquantized module."""
         return self if getattr(module, "quantization_config", None) is not None else None
+
+    @property
+    def producer_layout(self) -> ProducerLayout:
+        """Return the checkpoint layout of this format's producer."""
+        return self.producer_layouts.get(
+            getattr(self.quantization_config, "checkpoint_format", None), ProducerLayout()
+        )
 
     def _up_projections(self, model) -> tuple[str, ...]:
         """Return the up projections of the experts this format holds in `model`.
@@ -96,6 +125,12 @@ class BlockScaledQuantizer(HfQuantizer):
         For example, static FP8 maps a checkpoint `input_scale` to each projection's `*_activation_scale`.
         """
         return []
+
+    def format_weight_conversions(self, converters, model):
+        """Adjust the model's companion converters after the base quantizer has cloned them."""
+
+    def format_parallel_plan(self, model, plan):
+        """Set this format's companion placements after the shared parallel plan is built."""
 
     def get_param_ops(self, model: "PreTrainedModel", param_name: str) -> list:
         """Return the layout ops a tensor runs when it loads into `param_name`. Each op is reversed on save.
@@ -134,6 +169,56 @@ class BlockScaledQuantizer(HfQuantizer):
             # scales from on-the-fly quantization save through the conversions of their weights
             model._weight_conversions = self.update_weight_conversions(model._weight_conversions, model, for_save=True)
         return model
+
+    @staticmethod
+    def _per_expert_sources(proj: str, slot: str) -> list[str]:
+        """Return the per-expert checkpoint keys of `slot` that stack into the experts `proj`.
+
+        They match under any parent, such as `mlp.experts` or `mixer.experts`. The gate|up stack reads both halves.
+        """
+        halves = ("gate_proj", "up_proj") if proj == "gate_up_proj" else (proj,)
+        return [f"experts.*.{half}.{slot}" for half in halves]
+
+    def _block_scale_rename(self):
+        """Rename block scales while leaving the host's scalar embedding scales untouched."""
+        from ..core_model_loading import WeightRenaming
+
+        kept = "".join(rf"(?<!{re.escape(name)})" for name in self.embeddings)
+        shipped = self.producer_layout.block_scale_name
+        return WeightRenaming(source_patterns=rf"^(.+){kept}\.{shipped}", target_patterns=r"\1.weight_scale_inv")
+
+    def _activation_scale_conversions(self, up_projections, projections=FUSED_STACKS, ops=()) -> list:
+        """Return the conversions that load a calibrated `input_scale` into the module `activation_scale`.
+
+        The scale is renamed, then reduced to one per expert of `projections`, from either expert layout. `ops` run on
+        each value first.
+        """
+        from ..core_model_loading import MergeModulelist, WeightConverter, WeightRenaming
+        from ..integrations.finegrained.conversions import FineGrainedInputScales
+
+        rename = WeightRenaming(source_patterns=r"^(.+)\.input_scale", target_patterns=r"\1.activation_scale")
+        if not up_projections:
+            return [rename]
+        held = [proj for proj in projections if proj in (*up_projections, "down_proj")]
+        return [
+            rename,
+            *(
+                WeightConverter(
+                    source_patterns=self._per_expert_sources(proj, "activation_scale"),
+                    target_patterns=f"experts.{proj}_activation_scale",
+                    operations=[MergeModulelist(dim=0), *ops, FineGrainedInputScales(self)],
+                )
+                for proj in held
+            ),
+            *(
+                WeightConverter(
+                    source_patterns=rf"experts\.{proj}_input_scale",
+                    target_patterns=f"experts.{proj}_activation_scale",
+                    operations=[*ops, FineGrainedInputScales(self)],
+                )
+                for proj in held
+            ),
+        ]
 
     def _missing_requirement(self) -> str | None:
         """Return the first requirement of quantized compute that is missing, or `None`."""
@@ -214,8 +299,16 @@ class BlockScaledQuantizer(HfQuantizer):
         self.modules_to_not_convert = self.get_modules_to_not_convert(
             model, self.quantization_config.modules_to_not_convert, model._keep_in_fp32_modules
         )
-        # A dequantized load, pre-quantized or on the fly, keeps every module as it is
-        plan = {} if self.quantization_config.dequantize else self.plan()
+        plan = self.plan()
+        embeddings = set(map(embedding_pattern, self.embeddings))
+        if not self.pre_quantized:
+            # a dequantized on-the-fly load quantizes nothing. Embedding tables have no on-the-fly path.
+            plan = (
+                {} if self.quantization_config.dequantize else {p: c for p, c in plan.items() if p not in embeddings}
+            )
+        elif self.quantization_config.dequantize:
+            # an FP8 embedding table is too big to expand, so it stays FP8
+            plan = {pattern: config for pattern, config in plan.items() if pattern in embeddings}
         replaced = self.replace_modules(model, plan, self.modules_to_not_convert)
 
         ignored = set(model._keys_to_ignore_on_load_unexpected or [])
@@ -231,12 +324,18 @@ class BlockScaledQuantizer(HfQuantizer):
 
     def replace_modules(self, model, plan=None, modules_to_not_convert=None) -> bool:
         """Swap the modules `plan` covers for their quantized classes. `plan` defaults to this quantizer's own."""
-        from ..integrations.finegrained import FineGrainedExperts, FineGrainedGroupedLinear, FineGrainedLinear
+        from ..integrations.finegrained import (
+            FineGrainedEmbedding,
+            FineGrainedExperts,
+            FineGrainedGroupedLinear,
+            FineGrainedLinear,
+        )
 
         module_classes = {
             "linear": FineGrainedLinear,
             "grouped_linear": FineGrainedGroupedLinear,
             "experts": FineGrainedExperts,
+            "embedding": FineGrainedEmbedding,
         }
         plan = self.plan() if plan is None else plan
         return replace_with_quantized_modules(model, plan, modules_to_not_convert, module_classes)
@@ -253,6 +352,8 @@ class BlockScaledQuantizer(HfQuantizer):
         plan.update({key: overwrite.get(style, style) for key, style in plan.items()})
         _mask_expert_parallelism(model, plan)
         _shard_expert_companions(model, plan, original)
+        for member in self.members():
+            member.format_parallel_plan(model, plan)
 
     def is_serializable(self):
         return True
@@ -315,12 +416,22 @@ class BlockScaledQuantizer(HfQuantizer):
         )
         return conversions + _claimed(formats)
 
+    def get_checkpoint_renamings(self, model=None):
+        # rename a producer's block scale, e.g. `weight_scale`, onto its slot so it follows its weight's converter
+        if not self.pre_quantized:
+            return []
+        return _claimed(
+            member._block_scale_rename() for member in self.members() if member.producer_layout.block_scale_name
+        )
+
     def update_weight_conversions(self, weight_conversions, model, *, for_save=False):
         from ..core_model_loading import WeightConverter
         from ..integrations.finegrained.conversions import FineGrainedDeserialize
 
         conversions = super().update_weight_conversions(weight_conversions, model)
         converters = [conversion for conversion in conversions if isinstance(conversion, WeightConverter)]
+        for member in self.members():
+            member.format_weight_conversions(converters, model)
         for converter in converters:
             if not any(isinstance(op, FineGrainedDeserialize) for op in converter.operations):
                 converter.operations = [*converter.operations, FineGrainedDeserialize(self)]

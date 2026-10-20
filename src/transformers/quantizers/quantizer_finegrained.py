@@ -56,15 +56,19 @@ class FineGrainedHfQuantizer(BlockScaledQuantizer):
         configs = {id(config): config for config in self.plan().values()}.values()
         self._members = [AUTO_QUANTIZER_MAPPING[config.method.value](config, **kwargs) for config in configs]
         self._member_by_config = {id(member.quantization_config): member for member in self._members}
+        for member in self._members:
+            member.embeddings = self.embeddings
 
     def plan(self):
-        return self.quantization_config.dtype_plan if self._resolved_plan is None else self._resolved_plan
+        dtype_plan = self.quantization_config.dtype_plan if self._resolved_plan is None else self._resolved_plan
+        return {**self._embedding_plan(), **dtype_plan}
 
     def _process_model_before_weight_loading(self, model: "PreTrainedModel", **kwargs):
         # Plan patterns may use checkpoint module names. The saved config keeps them.
         to_checkpoint = checkpoint_module_namer(model)
         plan = self.quantization_config.dtype_plan
         resolved = dict(plan)
+        matched = set()
         for name, module in model.named_modules():
             if module_kind(name, module) is None:
                 continue
@@ -77,6 +81,15 @@ class FineGrainedHfQuantizer(BlockScaledQuantizer):
                 )
             if source is not None and native is None:
                 resolved[rf"^{re.escape(name)}$"] = source
+            matched.update(
+                pattern for pattern in plan if re.search(pattern, name) or re.search(pattern, checkpoint_name)
+            )
+        for pattern, config in plan.items():
+            if config.checkpoint_format == "modelopt" and pattern not in matched:
+                raise ValueError(
+                    f"ModelOpt target {pattern!r} matches no supported linear, expert, or embedding module. "
+                    "Per-expert assignments cannot target an architecture that stores fused expert tensors."
+                )
         self._resolved_plan = resolved
         return super()._process_model_before_weight_loading(model, **kwargs)
 
@@ -85,13 +98,8 @@ class FineGrainedHfQuantizer(BlockScaledQuantizer):
 
     def member_of(self, module) -> "BlockScaledQuantizer | None":
         config = getattr(module, "quantization_config", None)
-        if config is None:
-            return None
         member = self._member_by_config.get(id(config))
-        if member is not None:
-            return member
-        # A module may hold an equal copy of its entry's config
-        return next((m for m in self._members if m.quantization_config.to_dict() == config.to_dict()), None)
+        return member if member is not None or config is None else super().member_of(module)
 
     def get_param_ops(self, model: "PreTrainedModel", param_name: str) -> list:
         member = self.member_of(get_module_from_name(model, param_name)[0])

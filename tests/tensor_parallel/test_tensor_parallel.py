@@ -397,15 +397,6 @@ class TestTensorParallelLayer(TestCasePlus):
                 with self.subTest(marked=marked, style=type(style).__name__), torch.enable_grad():
                     self.assertIs(style.should_use_local_tensors(module), marked)
 
-    def test_resolving_the_plans_replicates_scalars(self):
-        model = torch.nn.Module()
-        model.q_proj = torch.nn.Linear(4, 4)
-        model.q_proj.scale = torch.nn.Parameter(torch.tensor(1.0))
-        model.tp_plan, model.ep_plan = {"q_proj": "colwise"}, {}
-        distributed_config = SimpleNamespace(tp_plan=None, ep_plan=None, tp_size=2, ep_size=1)
-        tp_plan, _ = resolve_parallel_plans(model, distributed_config)
-        self.assertEqual(tp_plan, {"q_proj": "colwise", "q_proj.scale": "replicate"})
-
     def test_experts_with_a_post_expert_norm_are_only_sharded_whole(self):
         """A post-expert norm reads whole expert outputs, so splitting an expert raises."""
         experts = torch.nn.Module()
@@ -427,6 +418,15 @@ class TestTensorParallelLayer(TestCasePlus):
                 self.assertEqual(placement.dim, dim)
                 self.assertEqual(getattr(placement, "split_factor", 1), 2 if "packed" in style else 1)
                 self.assertEqual(module.num_experts, 8)
+
+    def test_resolving_the_plans_replicates_scalars(self):
+        model = torch.nn.Module()
+        model.q_proj = torch.nn.Linear(4, 4)
+        model.q_proj.scale = torch.nn.Parameter(torch.tensor(1.0))
+        model.tp_plan, model.ep_plan = {"q_proj": "colwise"}, {}
+        distributed_config = SimpleNamespace(tp_plan=None, ep_plan=None, tp_size=2, ep_size=1)
+        tp_plan, _ = resolve_parallel_plans(model, distributed_config)
+        self.assertEqual(tp_plan, {"q_proj": "colwise", "q_proj.scale": "replicate"})
 
 
 class _DummyExperts(torch.nn.Module):
