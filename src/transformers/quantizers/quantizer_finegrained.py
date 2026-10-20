@@ -65,7 +65,6 @@ class FineGrainedHfQuantizer(BlockScaledQuantizer):
         to_checkpoint = checkpoint_module_namer(model)
         plan = self.quantization_config.dtype_plan
         resolved = dict(plan)
-        matched = set()
         for name, module in model.named_modules():
             if module_kind(name, module) is None:
                 continue
@@ -78,15 +77,6 @@ class FineGrainedHfQuantizer(BlockScaledQuantizer):
                 )
             if source is not None and native is None:
                 resolved[rf"^{re.escape(name)}$"] = source
-            matched.update(
-                pattern for pattern in plan if re.search(pattern, name) or re.search(pattern, checkpoint_name)
-            )
-        for pattern, config in plan.items():
-            if config.checkpoint_format == "modelopt" and pattern not in matched:
-                raise ValueError(
-                    f"ModelOpt target {pattern!r} matches no supported linear, expert, or embedding module. "
-                    "Per-expert assignments cannot target an architecture that stores fused expert tensors."
-                )
         self._resolved_plan = resolved
         return super()._process_model_before_weight_loading(model, **kwargs)
 

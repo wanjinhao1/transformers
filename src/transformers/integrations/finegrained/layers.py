@@ -582,7 +582,7 @@ class FineGrainedExperts(_FineGrainedModule, nn.Module):
 
         # in the model dtype, like the replaced experts
         bias = torch.empty(self.num_experts, rows) if self.has_bias else None
-        # one per expert, since `FineGrainedWeightGlobals` merges the separately calibrated gate and up halves
+        # one per expert
         weight_global = torch.ones(self.num_experts, dtype=self.global_scale_dtype) if self.two_level else None
         activation = torch.ones(self.num_experts, dtype=torch.float32) if self.holds_activation_scale else None
         _set_optional_parameter(self, f"{proj}_bias", bias)
