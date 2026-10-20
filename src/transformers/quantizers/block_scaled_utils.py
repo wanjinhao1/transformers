@@ -153,8 +153,15 @@ class BlockScaledQuantizer(HfQuantizer):
     def finish_modules(self, model):
         """What this format does to its loaded modules beyond what every format does."""
 
+    def postprocess_model(self, model, **kwargs):
+        if not self.pre_quantized and self.quantization_config.dequantize:
+            # Nothing was quantized, so the model loads as an unquantized one
+            self.remove_quantization_config(model)
+            return model
+        return super().postprocess_model(model, **kwargs)
+
     def _process_model_after_weight_loading(self, model, **kwargs):
-        from ..integrations.finegrained import assert_modules_are_quantized, disable_deepgemm_on_multi_device
+        from ..integrations.finegrained.layers import assert_modules_are_quantized, disable_deepgemm_on_multi_device
 
         for member in self.members():
             member.finish_modules(model)
@@ -268,9 +275,9 @@ class BlockScaledQuantizer(HfQuantizer):
     def param_needs_quantization(self, model: "PreTrainedModel", param_name: str, **kwargs) -> bool:
         from ..integrations.finegrained import FineGrainedExperts, FineGrainedLinear
 
-        module, tensor_name = get_module_from_name(model, param_name)
-        if self.pre_quantized:
+        if self.pre_quantized or self.quantization_config.dequantize:
             return False
+        module, tensor_name = get_module_from_name(model, param_name)
         if isinstance(module, FineGrainedExperts):
             return tensor_name in FUSED_STACKS
         return isinstance(module, FineGrainedLinear) and tensor_name == "weight"
@@ -296,8 +303,8 @@ class BlockScaledQuantizer(HfQuantizer):
         self.modules_to_not_convert = self.get_modules_to_not_convert(
             model, self.quantization_config.modules_to_not_convert, model._keep_in_fp32_modules
         )
-        # a dequantized load keeps every module as it is
-        plan = {} if self.pre_quantized and self.quantization_config.dequantize else self.plan()
+        # A dequantized load, pre-quantized or on the fly, keeps every module as it is
+        plan = {} if self.quantization_config.dequantize else self.plan()
         replaced = self.replace_modules(model, plan, self.modules_to_not_convert)
 
         ignored = set(model._keys_to_ignore_on_load_unexpected or [])
