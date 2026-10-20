@@ -2000,6 +2000,7 @@ def _modelopt_format(spec: dict) -> BlockScaledConfig:
         raise ValueError(f"Expected a modelopt format object; got {spec!r}")
     _check_block_scaled_features(spec)
     algo = spec.get("quant_algo")
+    # quant_algo -> (config, group_size, activation_format); None is W4A4
     formats = {
         "MXFP4": (Mxfp4Config, 32, None),
         "W4A16_MXFP4": (Mxfp4Config, 32, "bf16"),
