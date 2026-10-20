@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The `finegrained` conversion ops a load and a save run whatever the format: the layout ops (gate|up
-interleave, scale container, swizzle) and the ops each expert tensor takes from its module, and a core chain
-composed with on-the-fly quantization. Each format's checkpoint layouts are tested in its own folder. Pure
-torch: no kernel is loaded and no GPU is needed."""
+"""Tests for the format-independent `finegrained` conversion ops.
+
+They cover the layout ops, the per-module expert ops and a core chain combined with on-the-fly quantization.
+Each format's checkpoint layouts are tested in its own folder. No kernel or GPU is needed.
+"""
 
 import unittest
 from unittest import mock
@@ -38,7 +39,7 @@ from .utils import (
 
 @use_experts_implementation(is_transposed=True)
 class _TransposedExperts(torch.nn.Module):
-    """GPT-OSS's layout: the stacked experts stored `(E, in, out)`."""
+    """Stacked experts stored as `(E, in, out)`, like GPT-OSS."""
 
     def __init__(self, config):
         super().__init__()
@@ -48,12 +49,13 @@ class _TransposedExperts(torch.nn.Module):
 
 @require_torch
 class FineGrainedLayoutOpsTest(unittest.TestCase):
-    """The module HOLDS its block scales swizzled (a 5-D Parameter) when its chain runs the tcgen05
-    scaled-MMA under a triton dispatch on SM100 — keyed off the declared weight format, not the
-    scale dtype (V4-style block-FP8 ships UE8M0 scales) — and affine otherwise; the loader's
-    `FineGrainedSwizzleScales` op fills that layout and its reverse restores the checkpoint grid."""
+    """Check the scale layout the experts hold and the ops that fill it.
 
-    E, HIDDEN, INTER = 4, 256, 128  # gate_up rows 2*INTER = 256 and down rows HIDDEN = 256: whole 128-row blocks
+    MX formats on SM100 under a Triton backend hold swizzled 5-D scales. Every other case holds affine scales.
+    `FineGrainedSwizzleScales` fills the swizzled layout and its reverse restores the checkpoint grid.
+    """
+
+    E, HIDDEN, INTER = 4, 256, 128  # both projections have whole 128-row blocks
 
     def _experts(self, weight_format, activation_format=None, impl="grouped_mm", sm100=True):
         cfg = _Cfg()
@@ -68,7 +70,7 @@ class FineGrainedLayoutOpsTest(unittest.TestCase):
                 quantization_config=_format_config(
                     weight_format,
                     activation_format=activation_format,
-                    # the group formats fix their own block
+                    # The group formats fix their own block
                     **({"weight_block_size": (128, 128)} if weight_format == "fp8" else {}),
                 ),
             )
@@ -101,8 +103,7 @@ class FineGrainedLayoutOpsTest(unittest.TestCase):
             self.assertIs(out["experts.gate_up_proj_scale_inv"], affine)
 
     def test_ops_refuse_a_list_of_several_tensors(self):
-        """The loader hands a single-source tensor in a one-element list; an op that unwraps it must not
-        silently keep the first of several."""
+        """Check that an op unwrapping a one-element list refuses a list of several tensors."""
         from transformers.integrations.finegrained.conversions import (
             FineGrainedInputScalesSplit,
             FineGrainedPackedBlocks,
@@ -119,12 +120,11 @@ class FineGrainedLayoutOpsTest(unittest.TestCase):
         ):
             with self.subTest(op=type(op).__name__), self.assertRaises(ValueError):
                 op.convert({"experts.down_proj": [tensor, tensor]})
-        # a single target, re-keyed by the op before anything reads it
+        # The op re-keys a single target before reading it
         with self.assertRaises(ValueError):
             FineGrainedViewPackedInt8(None).convert({"x": [tensor, tensor]}, target_patterns=["experts.down_proj"])
 
 
 @require_torch
 class FineGrainedLoaderChainTest(unittest.TestCase):
-    """A core conversion chain and an on-the-fly quantization in the same load: the permute has to
-    run on the full-precision tensor, and only the finegrained module of the three gets a scale."""
+    """Check conversion chains that combine core ops with fine-grained ops in one load."""

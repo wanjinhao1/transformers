@@ -1688,7 +1688,7 @@ class SpQRConfig(QuantizationConfigMixin):
 
 
 class _FormatDefault:
-    """The `activation_format` a format config takes when none is passed."""
+    """Sentinel for an `activation_format` that was not passed."""
 
     def __repr__(self):
         return "the format's default"
@@ -1698,8 +1698,11 @@ _FORMAT_DEFAULT = cast(Any, _FormatDefault())
 
 
 def _loading_attributes(config, **attributes) -> dict[str, Any]:
-    """What a config passed to `from_pretrained` lends a pre-quantized checkpoint's own config: `dequantize`, the
-    skip-list when it sets one (left unset, the checkpoint's stays), and `attributes`."""
+    """Return the loading attributes a passed config lends to a pre-quantized checkpoint's config.
+
+    These are `dequantize`, `modules_to_not_convert` when it is set, and `attributes`.
+    An unset `modules_to_not_convert` keeps the checkpoint's.
+    """
     loading = {"dequantize": config.dequantize}
     if config.modules_to_not_convert is not None:
         loading["modules_to_not_convert"] = config.modules_to_not_convert
@@ -1707,9 +1710,11 @@ def _loading_attributes(config, **attributes) -> dict[str, Any]:
 
 
 class BlockScaledConfig(QuantizationConfigMixin):
-    """What every block-scaled weight format's config holds: the options of the format itself, which the quantized
-    modules read, and the loading options. One such config quantizes a whole model; a [`FineGrainedConfig`] maps
-    several onto parts of one. It is built as one of its formats.
+    """Base config for the block-scaled weight formats.
+
+    It holds the format options, which the quantized modules read, and the loading options.
+    One such config quantizes a whole model. A [`FineGrainedConfig`] maps several of them onto parts of one model.
+    Build one of the formats.
 
     Args:
         activation_format (`str | None`, *optional*, defaults to `the format's default`):
@@ -1722,11 +1727,11 @@ class BlockScaledConfig(QuantizationConfigMixin):
             Producer layout of the checkpoint tensors: `"compressed-tensors"` or `"modelopt"`.
     """
 
-    # what `quant_method` this config is, the activation formats its weights' kernels serve, and the one it takes
+    # The `quant_method`, the activation formats the kernels support, and the default one
     method: QuantizationMethod
     activation_formats: tuple[str | None, ...] = (None,)
     default_activation_format: str | None = None
-    # what each format fixes, FP8 aside, which takes them as options
+    # Fixed by each format. Only FP8 takes them as options.
     weight_block_size: tuple[int, int] | None = None
     scale_fmt: str = "float"
     activation_scheme: str = "dynamic"
@@ -1749,7 +1754,7 @@ class BlockScaledConfig(QuantizationConfigMixin):
         kwargs.pop("quant_method", None)
         if modules_to_not_convert is None and "ignored_layers" in kwargs:
             modules_to_not_convert = kwargs.pop("ignored_layers")
-        # a `config.json` may spell out what the format fixes, as its own value or as the shared default
+        # A `config.json` may spell out the fixed options, with the format's value or the shared default
         fixed = {
             name: kwargs.pop(name)
             for name in ("weight_block_size", "scale_fmt", "activation_scheme")
@@ -1758,7 +1763,7 @@ class BlockScaledConfig(QuantizationConfigMixin):
         changed = {
             name: value
             for name, value in fixed.items()
-            # a block size read back from `config.json` is a list
+            # `config.json` stores the block size as a list
             if (tuple(value) if isinstance(value, list) else value)
             not in (getattr(BlockScaledConfig, name), getattr(type(self), name))
         }
@@ -1770,7 +1775,7 @@ class BlockScaledConfig(QuantizationConfigMixin):
         if kwargs:
             logger.info(f"Unused kwargs: {list(kwargs)}. These kwargs are not used in {type(self).__name__}.")
         self.checkpoint_format = checkpoint_format
-        # a passed config lends its activation format to a pre-quantized checkpoint only where it names one
+        # A passed config overrides a checkpoint's activation format only when it names one
         self._names_activation_format = activation_format is not _FORMAT_DEFAULT
         self.activation_format = (
             self.default_activation_format if activation_format is _FORMAT_DEFAULT else activation_format
@@ -1785,7 +1790,7 @@ class BlockScaledConfig(QuantizationConfigMixin):
                 f"{self.method.value} weights take activation_format in {self.activation_formats}; "
                 f"got {self.activation_format!r}"
             )
-        # one spelling for the weights' own activation format
+        # Store the weight format's own activation format as `None`
         if self.activation_format == self.method.value:
             self.activation_format = None
         if self.checkpoint_format not in (None, "compressed-tensors", "modelopt"):
@@ -1801,8 +1806,8 @@ class BlockScaledConfig(QuantizationConfigMixin):
         """Raise if this checkpoint cannot run with the `activation_format` passed to `from_pretrained`."""
 
     def loading_attributes_lender(self, config):
-        # a `FineGrainedConfig` lends its loading options to a checkpoint in one format when its plan, if any, is that
-        # format alone, whose entry lends its activation format
+        # A `FineGrainedConfig` lends to a single-format checkpoint if its plan is empty or holds only that format.
+        # The plan entry then also lends its activation format.
         if not isinstance(config, FineGrainedConfig):
             return super().loading_attributes_lender(config)
         entries = list(config.dtype_plan.values())
@@ -1819,7 +1824,7 @@ class BlockScaledConfig(QuantizationConfigMixin):
         yield from self.to_dict().items()
 
 
-# the block-scaled formats by their `quant_method`, for a plan entry read back from `config.json`
+# Block-scaled format configs by `quant_method`, to read plan entries back from `config.json`
 BLOCK_SCALED_CONFIGS: dict[str, type[BlockScaledConfig]] = {}
 
 
@@ -1831,18 +1836,18 @@ class FineGrainedConfig(QuantizationConfigMixin):
 
     Args:
         dtype_plan (`dict[str, BlockScaledConfig]`, *optional*):
-            A module regex and the format config the modules it matches load in. A targeted entry wins over the
-            `".*"` catch-all; modules no entry covers stay in full precision. An entry takes no loading options
-            (`dequantize`, `modules_to_not_convert`): those are this config's. On a
-            pre-quantized checkpoint, a passed plan's entries replace the activation formats of the checkpoint's
-            entries under the same pattern.
+            Maps a module regex to the format config of the modules it matches. A targeted entry wins over the
+            `".*"` catch-all. Modules that no entry covers stay in full precision. Entries take no loading options.
+            Set `dequantize` and `modules_to_not_convert` on this config instead.
+            On a pre-quantized checkpoint, a passed plan only overrides the activation formats of the checkpoint's
+            entries with the same pattern.
         modules_to_not_convert (`list`, *optional*):
             Modules to keep in full precision.
         dequantize (`bool`, *optional*, defaults to `False`):
             Whether to dequantize the model to full precision while loading.
     """
 
-    # what an entry of the plan does not hold: they are the whole model's
+    # Loading options belong to the whole model, not to a plan entry
     _entry_loading_options = ("dequantize", "modules_to_not_convert")
 
     def __init__(
@@ -1862,7 +1867,7 @@ class FineGrainedConfig(QuantizationConfigMixin):
         self.dequantize = dequantize
 
     def _plan_entry(self, pattern: str, entry) -> BlockScaledConfig:
-        """`entry` as its format config: from `config.json`, a plain dict naming its format."""
+        """Return `entry` as a format config. An entry read from `config.json` is a dict with its `quant_method`."""
         if isinstance(entry, dict):
             method = entry.get("quant_method")
             if method not in BLOCK_SCALED_CONFIGS:
@@ -1901,8 +1906,8 @@ class FineGrainedConfig(QuantizationConfigMixin):
         return _loading_attributes(self, **({"dtype_plan": self.dtype_plan} if self.dtype_plan else {}))
 
     def loading_attributes_lender(self, config):
-        # a format's config lends its loading options to the plan, and its activation format to the plan's entries in
-        # its format
+        # A format config lends its loading options to the plan.
+        # It lends its activation format to the plan entries of the same format.
         if not isinstance(config, BlockScaledConfig):
             return super().loading_attributes_lender(config)
         entry = copy.copy(config)
