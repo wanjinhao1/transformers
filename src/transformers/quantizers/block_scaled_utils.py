@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 from ..utils import (
     is_accelerate_available,
+    is_kernels_available,
     is_torch_available,
     is_torch_xpu_available,
     logging,
@@ -241,6 +242,18 @@ class BlockScaledQuantizer(HfQuantizer):
                 )
                 self.quantization_config.dequantize = True
                 return
+
+        if not is_kernels_available():
+            from ..integrations.hub_kernels import _MISSING_KERNELS_MESSAGE
+
+            if not self.pre_quantized:
+                raise ImportError(f"Fine-grained quantization runs on hub kernels. {_MISSING_KERNELS_MESSAGE}")
+            logger.warning_once(
+                f"Fine-grained quantized models run on hub kernels, so we will dequantize the model to bf16. "
+                f"{_MISSING_KERNELS_MESSAGE}"
+            )
+            self.quantization_config.dequantize = True
+            return
 
         device_map = kwargs.get("device_map")
         if device_map is None:
