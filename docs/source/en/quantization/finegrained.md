@@ -16,10 +16,10 @@ rendered properly in your Markdown viewer.
 
 # Fine-grained
 
-[FP8](./fp8), [MXFP4](./mxfp4) and [NVFP4](./nvfp4) are block-scaled formats. They store low-precision weights with
-one scale per block or group of values. The three formats share one integration and one kernel bundle,
-[finegrained-kernels](https://huggingface.co/kernels-community/finegrained-kernels). Each format has its own config
-that quantizes a whole model. [`FineGrainedConfig`] mixes several formats in one model.
+[FP8](./fp8), [MXFP8](./mxfp8), [MXFP4](./mxfp4) and [NVFP4](./nvfp4) are block-scaled formats. They store
+low-precision weights with one scale per block or group of values. The four formats share one integration and one
+kernel bundle, [finegrained-kernels](https://huggingface.co/kernels-community/finegrained-kernels). Each format has its
+own config that quantizes a whole model. [`FineGrainedConfig`] mixes several formats in one model.
 
 This page covers what the formats share. Each format page covers its layouts and activation formats.
 
@@ -95,7 +95,7 @@ Some checkpoints load as a [`FineGrainedConfig`] without passing one.
   reads as a plan with one entry per group target.
 - A ModelOpt export with `quant_algo="MIXED_PRECISION"` reads its `quantized_layers` mapping. Each module name covers
   that module and its descendants. Modules missing from the mapping stay in full precision. The supported algorithms
-  are `FP8`, `NVFP4`, `MXFP4`, `W4A16_NVFP4` and `W4A16_MXFP4`. `FP8` is calibrated per-tensor FP8. The
+  are `FP8`, `NVFP4`, `MXFP8`, `MXFP4`, `W4A16_NVFP4` and `W4A16_MXFP4`. `FP8` is calibrated per-tensor FP8. The
   `W4A16` variants are weight-only.
 
 ```json
