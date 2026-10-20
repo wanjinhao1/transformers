@@ -506,8 +506,8 @@ def grouped_mm_experts_forward(
 
 
 _WEIGHT_LAYOUT_DESCRIPTIONS = {
-    "interleaved": "gate|up interleaved",
-    "stacked": "gate|up stacked and block scales row-major",
+    "triton": "gate|up interleaved or block scales swizzled",
+    "deepgemm": "gate|up stacked and block scales row-major",
 }
 
 
@@ -524,7 +524,7 @@ class ExpertsInterface(GeneralInterface):
     # Their weights take a layout the others cannot read, so they are chosen at load time only.
     _load_time_only: set[str] = {"deepgemm_megamoe"}
 
-    # The weight layout each implementation reads, `"interleaved"` or `"stacked"`.
+    # The weight layout each implementation reads, `"triton"` or `"deepgemm"`.
     # It only applies to experts that lay out their weights at load time. See `check_experts_weight_layout`.
     weight_layouts: dict[str, str] = {}
 

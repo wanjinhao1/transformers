@@ -209,7 +209,8 @@ class QuantizationConfigMixin:
         Return the config whose loading attributes override this checkpoint config.
 
         `config` is the config passed to `from_pretrained`. Return `None` if it cannot override this one.
-        By default only a config of the same class can.
+        By default only a config of the same class can. A format may accept others, e.g. an FP8 checkpoint takes
+        `FineGrainedConfig(dequantize=True)`.
         """
         return config if config.__class__.__name__ == self.__class__.__name__ else None
 
@@ -1723,7 +1724,8 @@ class BlockScaledConfig(QuantizationConfigMixin):
         modules_to_not_convert (`list | None`, *optional*):
             Module names or patterns to keep in full precision.
         checkpoint_format (`str | None`, *optional*):
-            Producer layout of the checkpoint tensors: `"compressed-tensors"` or `"modelopt"`.
+            Producer layout of the checkpoint tensors: `"compressed-tensors"` or `"modelopt"`. It picks the key
+            names the formats load, e.g. `weight_scale` instead of `weight_scale_inv`.
     """
 
     # The `quant_method` and the activation formats the kernels support
@@ -1797,6 +1799,7 @@ class BlockScaledConfig(QuantizationConfigMixin):
 
     def _check_activation_format(self, activation_format: str | None):
         """Raise if this checkpoint cannot run with the `activation_format` passed to `from_pretrained`."""
+        # first overridden by `NVFP4Config` in #49779, which rejects weight-only checkpoints
 
     def loading_attributes_lender(self, config):
         # A `FineGrainedConfig` lends to a single-format checkpoint if its plan is empty or holds only that format.
@@ -1812,6 +1815,7 @@ class BlockScaledConfig(QuantizationConfigMixin):
 
 
 # Block-scaled format configs by `quant_method`, to read plan entries back from `config.json`
+# the formats register here in #49777 to #49780, the tests patch in test-only formats
 BLOCK_SCALED_CONFIGS: dict[str, type[BlockScaledConfig]] = {}
 
 

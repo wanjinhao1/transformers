@@ -93,6 +93,7 @@ class BlockScaledQuantizer(HfQuantizer):
 
         Under `dequantize`, return what folding the keys needs beyond the shared `weight` + `weight_scale_inv` chain.
         `up_projections` are the up projections of the experts this format holds. It is empty without experts.
+        For example, static FP8 maps a checkpoint `input_scale` to each projection's `*_activation_scale`.
         """
         return []
 
@@ -193,10 +194,11 @@ class BlockScaledQuantizer(HfQuantizer):
 
     @property
     def quantized_element_size(self) -> float:
-        # FP4 modules hold two values per byte in a half-width weight
+        # an FP4 weight is already `K // 2` bytes wide, so count one byte per held element
         return 1
 
     def get_new_dtype(self, converter, param, dtype):
+        # keep calibrated scales in their fp32 checkpoint dtype, never the model dtype
         if any(name.endswith(("activation_scale", "_global_scale")) for name in converter.target_patterns):
             return None
         # a float scale takes the module UE8M0 dtype, e.g. the fp32 scales of DeepSeek-V4-Base
@@ -351,6 +353,7 @@ _EXPERT_ROW_STYLES = {
     "packed_colwise": "moe_experts_packed_colwise",
     "colwise": "moe_experts_colwise",
     "rowwise": "moe_experts_rowwise",
+    # a rowwise split cuts K, not the packed gate|up rows
     "packed_rowwise": "moe_experts_rowwise",
 }
 

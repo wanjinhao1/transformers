@@ -174,8 +174,11 @@ class FineGrainedInterleaveGateUp(_FineGrainedOp):
     def convert(self, input_dict, model=None, full_layer_name=None, target_patterns=None, **kwargs):
         input_dict = keyed_by_target(input_dict, target_patterns)
         experts = finegrained_experts(model, full_layer_name)
+        if experts is None or not experts.has_gate:
+            return input_dict
         # `is_concatenated` means the checkpoint stacks gate and up
-        if experts is None or not experts.has_gate or experts.is_concatenated != experts.holds_interleaved_gate_up:
+        layouts_differ = experts.is_concatenated == experts.holds_interleaved_gate_up
+        if not layouts_differ:
             return input_dict
         # `Interleave(inverse=True)` goes from stacked to interleaved
         interleave = Interleave(dim=1, inverse=experts.holds_interleaved_gate_up != self.inverse)
@@ -247,7 +250,7 @@ class FineGrainedQuantize(_FineGrainedOp):
         """
         if module is None or value.ndim != 3 or name not in FUSED_STACKS:
             return value
-        return value.transpose(1, 2).contiguous() if getattr(module, "ships_transposed", False) else value
+        return value.transpose(1, 2).contiguous() if getattr(module, "source_is_transposed", False) else value
 
     @staticmethod
     def _weight_holder(model, key: str):
