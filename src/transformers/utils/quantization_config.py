@@ -1730,7 +1730,7 @@ class BlockScaledConfig(QuantizationConfigMixin):
 
     It holds the format options, which the quantized modules read, and the loading options.
     One such config quantizes a whole model. A [`FineGrainedConfig`] maps several of them onto parts of one model.
-    Build one of the formats: [`Fp8Config`] or [`Mxfp4Config`].
+    Build one of the formats: [`Fp8Config`], [`Mxfp4Config`] or [`NVFP4Config`].
 
     Args:
         activation_format (`str | None`, *optional*):
@@ -1920,15 +1920,53 @@ class Mxfp4Config(BlockScaledConfig):
         )
 
 
+class NVFP4Config(BlockScaledConfig):
+    """NVFP4 weights, as NVIDIA ModelOpt exports them.
+
+    Weights are E2M1, packed two per byte, with one E4M3 scale per 16 values and an fp32 global scale.
+    It can also quantize a full-precision checkpoint on the fly.
+
+    Args:
+        modules_to_not_convert (`list`, *optional*):
+            Module names or patterns to keep in full precision.
+        activation_format (`str | None`, *optional*):
+            Activation format for the quantized layers. `None` quantizes them to NVFP4. `"bf16"` keeps them in full
+            precision.
+        kwargs (`dict[str, Any]`, *optional*):
+            Options shared by every block-scaled format. See [`BlockScaledConfig`].
+    """
+
+    method = QuantizationMethod.NVFP4
+    activation_formats = (None, "nvfp4", "bf16")
+    weight_block_size = (1, 16)
+
+    def __init__(
+        self,
+        modules_to_not_convert: list | None = None,
+        *,
+        activation_format: str | None = None,
+        **kwargs,
+    ):
+        super().__init__(modules_to_not_convert=modules_to_not_convert, activation_format=activation_format, **kwargs)
+
+    def _check_activation_format(self, activation_format):
+        # Quantized activations need the calibrated activation globals that a weight-only checkpoint lacks
+        if self.activation_format == "bf16" and activation_format != "bf16":
+            raise ValueError(
+                "This NVFP4 checkpoint is weight-only: it ships no calibrated activation globals (`input_scale`), which "
+                f"activation_format={activation_format!r} quantizes against. Load it with activation_format='bf16'."
+            )
+
+
 # Block-scaled format configs by `quant_method`, to read plan entries back from `config.json`
-BLOCK_SCALED_CONFIGS = {config.method.value: config for config in (Fp8Config, Mxfp4Config)}
+BLOCK_SCALED_CONFIGS = {config.method.value: config for config in (Fp8Config, Mxfp4Config, NVFP4Config)}
 
 
 def plan_from_config_groups(spec: dict) -> dict[str, BlockScaledConfig] | None:
     """Return one `config_groups` entry as `dtype_plan` entries, one per target.
 
     Return `None` if the entry uses a format these kernels do not support.
-    The format follows from the parameters.
+    The format follows from the parameters. `group_size` tells NVFP4 from MXFP4.
     A bare target is a class name, and `"Linear"` means every linear. A target starting with `re:` is a pattern.
     """
     try:
@@ -1936,6 +1974,7 @@ def plan_from_config_groups(spec: dict) -> dict[str, BlockScaledConfig] | None:
     except ValueError:
         return None
     formats = {
+        (4, "float", 16): "nvfp4",
         (4, "float", 32): "mxfp4",
         (8, "float", None): "fp8",
     }
@@ -1967,7 +2006,8 @@ def plan_from_config_groups(spec: dict) -> dict[str, BlockScaledConfig] | None:
         return None
     options = {"activation_format": activation_format}
     if quant_method == "fp8":
-        # Only a per-tensor activation scale is calibrated
+        # Only a per-tensor scale is calibrated. On group-scaled activations, `dynamic: false` marks NVFP4's
+        # global `input_scale`, which the loader handles separately.
         static = not activations.get("dynamic", True) and act_key == (8, "float", None)
         options.update(
             activation_scheme="static" if static else "dynamic", weight_block_size=weights.get("block_structure")
@@ -2002,6 +2042,8 @@ def _modelopt_format(spec: dict) -> BlockScaledConfig:
     algo = spec.get("quant_algo")
     # quant_algo -> (config, group_size, activation_format); None is W4A4
     formats = {
+        "NVFP4": (NVFP4Config, 16, None),
+        "W4A16_NVFP4": (NVFP4Config, 16, "bf16"),
         "MXFP4": (Mxfp4Config, 32, None),
         "W4A16_MXFP4": (Mxfp4Config, 32, "bf16"),
     }
@@ -2101,7 +2143,7 @@ def read_compressed_tensors(config_dict: dict) -> QuantizationConfigMixin | None
     if config_dict.get("quantization_status", "compressed") != "compressed":
         return None
     groups = config_dict.get("config_groups") or {}
-    served = ("float-quantized",)
+    served = ("float-quantized", "nvfp4-pack-quantized")
     if not groups or any(spec.get("format", config_dict.get("format")) not in served for spec in groups.values()):
         return None
     mapped = [plan_from_config_groups(spec) for spec in groups.values()]
@@ -2134,13 +2176,14 @@ def _config_for_plan(dtype_plan: dict, modules_to_not_convert: list | None) -> Q
 class FineGrainedConfig(QuantizationConfigMixin):
     """
     Configuration for a model whose modules are quantized in different fine-grained formats: which format covers
-    which modules, each as its own format config ([`Fp8Config`], [`Mxfp4Config`]), and the options that hold for
-    the whole model. A model in one format takes that format's config alone.
+    which modules, each as its own format config ([`Fp8Config`], [`Mxfp4Config`], [`NVFP4Config`]), and the options
+    that hold for the whole model. A model in one format takes that format's config alone.
 
     | format    | weights                        | block scales                | a checkpoint that ships it |
     |-----------|--------------------------------|-----------------------------|----------------------------|
     | FP8       | `float8_e4m3fn`                | fp32 or UE8M0, 128x128      | `deepseek-ai/DeepSeek-V3`  |
     | MXFP4     | E2M1, two values per `int8`    | UE8M0, group-32             | `openai/gpt-oss-20b`       |
+    | NVFP4     | E2M1, two values per `int8`    | E4M3 group-16 + fp32 global | `nvidia/GLM-5.2-NVFP4`     |
 
     Args:
         dtype_plan (`dict[str, BlockScaledConfig]`, *optional*):
@@ -2588,25 +2631,6 @@ class GemmaQuantizationConfig(QuantizationConfigMixin):
         self.quantize_embeddings = quantize_embeddings
         self.module_quant_configs = module_quant_configs
         self.modules_to_not_convert = modules_to_not_convert
-
-
-class NVFP4Config(QuantizationConfigMixin):
-    """Configuration for on-the-fly NVFP4 weight quantization.
-
-    Args:
-        modules_to_not_convert (`list[str]`, *optional*):
-            Module-name patterns that should remain in their original precision.
-        kwargs (`dict[str, Any]`, *optional*):
-            Additional values are ignored and reported through the Transformers logger.
-    """
-
-    def __init__(self, modules_to_not_convert: list[str] | None = None, **kwargs):
-        self.quant_method = QuantizationMethod.NVFP4
-        self.modules_to_not_convert = modules_to_not_convert
-        if kwargs:
-            logger.info(
-                f"Unused kwargs: {list(kwargs.keys())}. These kwargs are not used in {self.__class__.__name__}."
-            )
 
 
 @dataclass

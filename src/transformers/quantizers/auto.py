@@ -311,6 +311,9 @@ class AutoHfQuantizer:
             for attr, val in loading_attr_dict.items():
                 if attr == "dtype_plan" and isinstance(quantization_config, FineGrainedConfig):
                     val = _with_activation_formats(quantization_config.dtype_plan, val)
+                elif attr == "activation_format" and not quantization_config.dequantize:
+                    # `dequantize` is set first, and a dequantized model runs no activation format
+                    quantization_config._check_activation_format(val)
                 setattr(quantization_config, attr, val)
             if isinstance(quantization_config, BlockScaledConfig):
                 # Check that the passed attributes are consistent with the checkpoint's
@@ -399,6 +402,7 @@ def _with_activation_formats(dtype_plan: dict, passed_plan: dict) -> dict:
     merged = dict(dtype_plan)
     for pattern, entry in passed_plan.items():
         if type(merged.get(pattern)) is type(entry):
+            merged[pattern]._check_activation_format(entry.activation_format)
             merged[pattern] = copy.copy(merged[pattern])
             merged[pattern].activation_format = entry.activation_format
             merged[pattern].post_init()

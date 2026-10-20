@@ -72,6 +72,8 @@ class BlockScaledQuantizer(HfQuantizer):
     requires_calibration = False
     dequantized_saves_unquantized = True
     quantization_config: "BlockScaledConfig | FineGrainedConfig"
+    # checkpoint keys that producers ship and no module holds
+    unexpected_keys: tuple[str, ...] = ()
     # producer layout per `checkpoint_format`. Unlisted formats use the module slots as is.
     producer_layouts: dict[str | None, ProducerLayout] = {}
 
@@ -325,6 +327,8 @@ class BlockScaledQuantizer(HfQuantizer):
         replaced = self.replace_modules(model, plan, self.modules_to_not_convert)
 
         ignored = set(model._keys_to_ignore_on_load_unexpected or [])
+        for member in self.members():
+            ignored.update(member.unexpected_keys)
         # without an activation scale in the model, a calibrated `input_scale` is unused but still valid
         if not any(name.endswith("activation_scale") for name, _ in model.named_parameters()):
             ignored.add(r"input(_global)?_scale$")
