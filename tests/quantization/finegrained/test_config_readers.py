@@ -29,19 +29,6 @@ from ...integrations.finegrained.utils import _compressed_tensors, _modelopt, _q
 class BlockScaledCheckpointReaderTest(unittest.TestCase):
     """How modelopt and compressed-tensors exports read into block-scaled configs."""
 
-    def test_compressed_tensors_checkpoints_we_do_not_serve_stay_with_it(self):
-        """Check that integer, per-channel FP8 and sparse checkpoints stay with compressed-tensors."""
-
-        int4 = {"num_bits": 4, "type": "int", "group_size": 128, "strategy": "group"}
-        channel = {"num_bits": 8, "type": "float", "strategy": "channel"}
-        nvfp4 = {"num_bits": 4, "type": "float", "group_size": 16}
-        for checkpoint in (
-            _compressed_tensors(int4, fmt="pack-quantized"),
-            _compressed_tensors(channel, fmt="float-quantized"),
-            _compressed_tensors(nvfp4, sparsity_config={"format": "sparse-24-bitmask"}),
-        ):
-            self.assertIsNone(read_compressed_tensors(checkpoint))
-
     def test_a_producers_config_groups_are_normalized(self):
         """Check that modelopt config groups read as one named format.
 
@@ -151,26 +138,25 @@ class BlockScaledCheckpointReaderTest(unittest.TestCase):
         self.assertIsInstance(config, NVFP4Config)
         self.assertEqual(config.checkpoint_format, "compressed-tensors")
 
-    def test_unrepresentable_modelopt_targets_raise_before_loading(self):
-        model = torch.nn.Module()
-        model.linear = torch.nn.Linear(16, 16)
-        for target in ("unknown", "experts.0.gate_proj"):
-            config = AutoQuantizationConfig.from_dict(
-                {
-                    "quant_method": "modelopt",
-                    "quant_algo": "MIXED_PRECISION",
-                    "quantized_layers": {target: {"quant_algo": "NVFP4"}},
-                }
-            )
-            with self.subTest(target=target), self.assertRaisesRegex(ValueError, "matches no supported"):
-                _quantizer_for(config)._process_model_before_weight_loading(model)
+    def test_compressed_tensors_checkpoints_we_do_not_serve_stay_with_it(self):
+        """Check that integer, per-channel FP8 and sparse checkpoints stay with compressed-tensors."""
+
+        int4 = {"num_bits": 4, "type": "int", "group_size": 128, "strategy": "group"}
+        channel = {"num_bits": 8, "type": "float", "strategy": "channel"}
+        nvfp4 = {"num_bits": 4, "type": "float", "group_size": 16}
+        for checkpoint in (
+            _compressed_tensors(int4, fmt="pack-quantized"),
+            _compressed_tensors(channel, fmt="float-quantized"),
+            _compressed_tensors(nvfp4, sparsity_config={"format": "sparse-24-bitmask"}),
+        ):
+            self.assertIsNone(read_compressed_tensors(checkpoint))
 
     def test_activations_the_weights_kernels_do_not_serve_stay_with_compressed_tensors(self):
-        """Check that activation schemes the weights' kernels do not serve stay with compressed-tensors.
+        """An activation scheme is read only where the weights' kernels serve it: NVFP4 weights with FP8 per-token
+        activations and FP8 weights with int8 activations stay compressed-tensors' own, as do
+        group-32 FP8 weights whose scales are not E8M0 (MXFP8's)."""
+        from transformers.utils.quantization_config import Mxfp8Config, read_compressed_tensors
 
-        This covers NVFP4 weights with FP8 per-token activations and FP8 weights with int8 activations.
-        It also covers group-32 FP8 weights whose scales are not E8M0.
-        """
         nvfp4 = {"num_bits": 4, "type": "float", "group_size": 16, "strategy": "tensor_group"}
         block = {"num_bits": 8, "type": "float", "strategy": "block", "block_structure": [128, 128]}
         fp8_token = {"num_bits": 8, "type": "float", "strategy": "token", "dynamic": True}
@@ -186,6 +172,24 @@ class BlockScaledCheckpointReaderTest(unittest.TestCase):
         ):
             with self.subTest(name):
                 self.assertIsNone(read_compressed_tensors(checkpoint))
+        e8m0 = {**group_32, "scale_dtype": "torch.float8_e8m0fnu"}
+        self.assertIsInstance(
+            read_compressed_tensors(_compressed_tensors(e8m0, group_32, fmt="float-quantized")), Mxfp8Config
+        )
+
+    def test_unrepresentable_modelopt_targets_raise_before_loading(self):
+        model = torch.nn.Module()
+        model.linear = torch.nn.Linear(16, 16)
+        for target in ("unknown", "experts.0.gate_proj"):
+            config = AutoQuantizationConfig.from_dict(
+                {
+                    "quant_method": "modelopt",
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {target: {"quant_algo": "NVFP4"}},
+                }
+            )
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, "matches no supported"):
+                _quantizer_for(config)._process_model_before_weight_loading(model)
 
 
 class FineGrainedConfigGroupReaderTest(unittest.TestCase):
@@ -199,6 +203,14 @@ class FineGrainedConfigGroupReaderTest(unittest.TestCase):
         groups = [("nvfp4", nvfp4), ("other", nvfp4 if identical else fp8)]
         return dict(reversed(groups) if reverse else groups)
 
+    def test_modelopt_rejects_conflicting_group_targets_in_either_order(self):
+        for reverse in (False, True):
+            with (
+                self.subTest(reverse=reverse),
+                self.assertRaisesRegex(ValueError, "Conflicting quantization configs for target"),
+            ):
+                read_modelopt({"quant_algo": "NVFP4", "config_groups": self._groups(reverse=reverse)})
+
     def test_compressed_tensors_keeps_its_backend_for_conflicting_group_targets(self):
         for reverse in (False, True):
             with self.subTest(reverse=reverse):
@@ -207,14 +219,6 @@ class FineGrainedConfigGroupReaderTest(unittest.TestCase):
                         {"format": "float-quantized", "config_groups": self._groups(reverse=reverse)}
                     )
                 )
-
-    def test_modelopt_rejects_conflicting_group_targets_in_either_order(self):
-        for reverse in (False, True):
-            with (
-                self.subTest(reverse=reverse),
-                self.assertRaisesRegex(ValueError, "Conflicting quantization configs for target"),
-            ):
-                read_modelopt({"quant_algo": "NVFP4", "config_groups": self._groups(reverse=reverse)})
 
     def test_identical_group_targets_can_share_a_config(self):
         for reverse in (False, True):

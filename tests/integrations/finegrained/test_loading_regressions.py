@@ -33,7 +33,7 @@ from transformers.integrations.finegrained.conversions import FineGrainedDequant
 from transformers.quantizers.auto import AutoQuantizationConfig
 from transformers.quantizers.quantizer_finegrained import FineGrainedHfQuantizer
 from transformers.testing_utils import require_torch
-from transformers.utils.quantization_config import FineGrainedConfig, Fp8Config, Mxfp4Config
+from transformers.utils.quantization_config import FineGrainedConfig, Fp8Config, Mxfp4Config, Mxfp8Config
 
 from .utils import _ChainAssertions, _load_and_save, _per_expert
 
@@ -48,82 +48,6 @@ def _quantized_weights(model):
 
 @require_torch
 class FineGrainedLoadingRegressionTest(_ChainAssertions, unittest.TestCase):
-    def test_mixed_block_sizes_use_the_current_modules_grid(self):
-        # Both block sizes give a 2x2 scale grid for 192x192 weights, with different boundaries
-        quantizer = FineGrainedHfQuantizer(
-            FineGrainedConfig(
-                dtype_plan={
-                    "a$": Fp8Config(weight_block_size=(96, 96)),
-                    "b$": Fp8Config(weight_block_size=(128, 128)),
-                },
-                dequantize=True,
-            )
-        )
-        model = torch.nn.Module()
-        model.a = torch.nn.Linear(192, 192, bias=False)
-        model.b = torch.nn.Linear(192, 192, bias=False)
-        scales = torch.tensor([[1.0, 2.0], [4.0, 8.0]])
-        for name, block in (("a", 96), ("b", 128)):
-            with self.subTest(module=name):
-                result = FineGrainedDequantize(quantizer).convert(
-                    {"weight": torch.ones(192, 192).to(torch.float8_e4m3fn), "weight_scale_inv": scales},
-                    full_layer_name=f"{name}.weight",
-                    model=model,
-                )[f"{name}.weight"]
-                expected = scales.repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)[:192, :192]
-                torch.testing.assert_close(result, expected)
-
-    def test_modelopt_static_fp8_checkpoint_loads_and_saves_dense_and_experts(self):
-        checkpoint = _per_expert(
-            lambda rows, cols: {
-                "weight": torch.full((rows, cols), 2, dtype=torch.float8_e4m3fn),
-                "weight_scale": torch.tensor(1 / 128),
-                "input_scale": torch.tensor(1 / 256),
-            }
-        )
-        for name in checkpoint:
-            if name.endswith(".up_proj.weight_scale"):
-                checkpoint[name] = torch.tensor(1 / 64)
-        config = AutoQuantizationConfig.from_dict({"quant_method": "modelopt", "quant_algo": "FP8"})
-        model, info, saved = _load_and_save(checkpoint, config)
-        self.assertLoadsCleanly(info)
-        q_proj = model.model.layers[0].self_attn.q_proj
-        self.assertEqual(q_proj.weight.dtype, torch.float8_e4m3fn)
-        torch.testing.assert_close(q_proj.weight_scale_inv, torch.tensor(1 / 128))
-        torch.testing.assert_close(q_proj.activation_scale, torch.tensor(1 / 256))
-        experts = model.model.layers[0].mlp.experts
-        torch.testing.assert_close(
-            experts.gate_up_proj_scale_inv,
-            torch.tensor([[[1 / 128], [1 / 64]], [[1 / 128], [1 / 64]]]),
-        )
-        self.assertSavesBack(saved, checkpoint)
-
-    def test_modelopt_mx_checkpoint_loads_and_saves_dense_and_expert_weights(self):
-        for format_name, config_class in (("mxfp4", Mxfp4Config),):
-            with self.subTest(format=format_name):
-                packed = format_name == "mxfp4"
-                checkpoint = _per_expert(
-                    lambda rows, cols: {
-                        "weight": (
-                            torch.full((rows, cols // 2), 0xB2, dtype=torch.uint8)
-                            if packed
-                            else torch.full((rows, cols), 2, dtype=torch.float8_e4m3fn)
-                        ),
-                        "weight_scale": torch.full((rows, cols // 32), 121, dtype=torch.uint8),
-                    }
-                )
-                model, info, saved = _load_and_save(checkpoint, config_class(checkpoint_format="modelopt"))
-                self.assertLoadsCleanly(info)
-                q_proj = model.model.layers[0].self_attn.q_proj
-                experts = model.model.layers[0].mlp.experts
-                if packed:
-                    self.assertEqual(q_proj.weight.dtype, torch.int8)
-                    self.assertEqual(experts.gate_up_proj.dtype, torch.int8)
-                    torch.testing.assert_close(
-                        q_proj.weight.view(torch.uint8), checkpoint["model.layers.0.self_attn.q_proj.weight"]
-                    )
-                self.assertSavesBack(saved, checkpoint)
-
     def _checkpoint(self, directory, moe=False, mixed=False, modelopt_mixed=False):
         config_class = Qwen2MoeConfig if moe else LlamaConfig
         config = config_class(
@@ -238,6 +162,31 @@ class FineGrainedLoadingRegressionTest(_ChainAssertions, unittest.TestCase):
                 torch.testing.assert_close(loaded.state_dict()[name], tensor)
                 torch.testing.assert_close(tensor, torch.full_like(tensor, 1 / 64))
 
+    def test_mixed_block_sizes_use_the_current_modules_grid(self):
+        # Both block sizes give a 2x2 scale grid for 192x192 weights, with different boundaries
+        quantizer = FineGrainedHfQuantizer(
+            FineGrainedConfig(
+                dtype_plan={
+                    "a$": Fp8Config(weight_block_size=(96, 96)),
+                    "b$": Fp8Config(weight_block_size=(128, 128)),
+                },
+                dequantize=True,
+            )
+        )
+        model = torch.nn.Module()
+        model.a = torch.nn.Linear(192, 192, bias=False)
+        model.b = torch.nn.Linear(192, 192, bias=False)
+        scales = torch.tensor([[1.0, 2.0], [4.0, 8.0]])
+        for name, block in (("a", 96), ("b", 128)):
+            with self.subTest(module=name):
+                result = FineGrainedDequantize(quantizer).convert(
+                    {"weight": torch.ones(192, 192).to(torch.float8_e4m3fn), "weight_scale_inv": scales},
+                    full_layer_name=f"{name}.weight",
+                    model=model,
+                )[f"{name}.weight"]
+                expected = scales.repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)[:192, :192]
+                torch.testing.assert_close(result, expected)
+
     def test_modelopt_mixed_precision_checkpoint_loads_and_saves(self):
         for rename_namespace in (False, True):
             with (
@@ -293,3 +242,89 @@ class FineGrainedLoadingRegressionTest(_ChainAssertions, unittest.TestCase):
                     reloaded = AutoModelForCausalLM.from_pretrained(saved).eval()
                     with torch.no_grad():
                         torch.testing.assert_close(reloaded(inputs).logits, expected)
+
+    def test_modelopt_mx_checkpoint_loads_and_saves_dense_and_expert_weights(self):
+        for format_name, config_class in (("mxfp8", Mxfp8Config), ("mxfp4", Mxfp4Config)):
+            with self.subTest(format=format_name):
+                packed = format_name == "mxfp4"
+                checkpoint = _per_expert(
+                    lambda rows, cols: {
+                        "weight": (
+                            torch.full((rows, cols // 2), 0xB2, dtype=torch.uint8)
+                            if packed
+                            else torch.full((rows, cols), 2, dtype=torch.float8_e4m3fn)
+                        ),
+                        "weight_scale": torch.full((rows, cols // 32), 121, dtype=torch.uint8),
+                    }
+                )
+                model, info, saved = _load_and_save(checkpoint, config_class(checkpoint_format="modelopt"))
+                self.assertLoadsCleanly(info)
+                q_proj = model.model.layers[0].self_attn.q_proj
+                experts = model.model.layers[0].mlp.experts
+                if packed:
+                    self.assertEqual(q_proj.weight.dtype, torch.int8)
+                    self.assertEqual(experts.gate_up_proj.dtype, torch.int8)
+                    torch.testing.assert_close(
+                        q_proj.weight.view(torch.uint8), checkpoint["model.layers.0.self_attn.q_proj.weight"]
+                    )
+                self.assertSavesBack(saved, checkpoint)
+
+    def test_modelopt_static_fp8_checkpoint_loads_and_saves_dense_and_experts(self):
+        checkpoint = _per_expert(
+            lambda rows, cols: {
+                "weight": torch.full((rows, cols), 2, dtype=torch.float8_e4m3fn),
+                "weight_scale": torch.tensor(1 / 128),
+                "input_scale": torch.tensor(1 / 256),
+            }
+        )
+        for name in checkpoint:
+            if name.endswith(".up_proj.weight_scale"):
+                checkpoint[name] = torch.tensor(1 / 64)
+        config = AutoQuantizationConfig.from_dict({"quant_method": "modelopt", "quant_algo": "FP8"})
+        model, info, saved = _load_and_save(checkpoint, config)
+        self.assertLoadsCleanly(info)
+        q_proj = model.model.layers[0].self_attn.q_proj
+        self.assertEqual(q_proj.weight.dtype, torch.float8_e4m3fn)
+        torch.testing.assert_close(q_proj.weight_scale_inv, torch.tensor(1 / 128))
+        torch.testing.assert_close(q_proj.activation_scale, torch.tensor(1 / 256))
+        experts = model.model.layers[0].mlp.experts
+        torch.testing.assert_close(
+            experts.gate_up_proj_scale_inv,
+            torch.tensor([[[1 / 128], [1 / 64]], [[1 / 128], [1 / 64]]]),
+        )
+        self.assertSavesBack(saved, checkpoint)
+
+    def test_compressed_tensors_mxfp8_scales_reach_dense_and_expert_modules(self):
+        config = AutoQuantizationConfig.from_dict(
+            {
+                "quant_method": "compressed-tensors",
+                "format": "float-quantized",
+                "config_groups": {
+                    "group_0": {
+                        "targets": ["Linear"],
+                        "weights": {"num_bits": 8, "type": "float", "strategy": "group", "group_size": 32},
+                        "input_activations": {
+                            "num_bits": 8,
+                            "type": "float",
+                            "strategy": "group",
+                            "group_size": 32,
+                            "dynamic": True,
+                        },
+                    }
+                },
+            }
+        )
+        self.assertIsInstance(config, Mxfp8Config)
+        checkpoint = _per_expert(
+            lambda rows, cols: {
+                "weight": torch.full((rows, cols), 2, dtype=torch.float8_e4m3fn),
+                "weight_scale": torch.full((rows, cols // 32), 121, dtype=torch.uint8),
+            }
+        )
+        model, info, saved = _load_and_save(checkpoint, config)
+        self.assertLoadsCleanly(info)
+        torch.testing.assert_close(
+            model.model.layers[0].self_attn.q_proj.weight_scale_inv,
+            checkpoint["model.layers.0.self_attn.q_proj.weight_scale"],
+        )
+        self.assertSavesBack(saved, checkpoint)
