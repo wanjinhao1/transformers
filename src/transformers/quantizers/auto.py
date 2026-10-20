@@ -219,11 +219,11 @@ class AutoQuantizationConfig:
 def _quantization_config_from_dict(quantization_config, quantization_config_from_args):
     """Build the config object of a checkpoint's `quantization_config` dict.
 
-    A passed config of `CHECKPOINT_READING_CONFIG_TYPES` takes priority over the automatic dispatch.
+    A passed config that reads the checkpoint's config as its own class takes priority over the automatic dispatch.
     """
     if not isinstance(quantization_config, dict):
         return quantization_config
-    if isinstance(quantization_config_from_args, CHECKPOINT_READING_CONFIG_TYPES):
+    if _reads_checkpoint_config(quantization_config_from_args, quantization_config):
         return type(quantization_config_from_args).from_dict(quantization_config)
     return AutoQuantizationConfig.from_dict(quantization_config)
 
@@ -375,6 +375,14 @@ def register_quantizer(name: str):
         return cls
 
     return register_quantizer_fn
+
+
+def _reads_checkpoint_config(passed: QuantizationConfigMixin | None, checkpoint: dict) -> bool:
+    """Return whether the passed config reads the checkpoint's config dict as its own class."""
+    if isinstance(passed, FineGrainedFP8Config):
+        # The frozen integration reads only its own checkpoints. Others then fail the merge's class check.
+        return checkpoint.get("quant_method") in ("fp8", "mxfp8")
+    return isinstance(passed, CHECKPOINT_READING_CONFIG_TYPES)
 
 
 def _with_activation_formats(dtype_plan: dict, passed_plan: dict) -> dict:
