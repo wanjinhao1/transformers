@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
-import json
 import warnings
 
 from ..models.auto.configuration_auto import AutoConfig
@@ -281,13 +280,10 @@ class AutoHfQuantizer:
                 )
             quantization_config_from_args = lender
 
-        ignored = []
         if isinstance(quantization_config, LOADING_ATTRIBUTES_CONFIG_TYPES) and isinstance(
             quantization_config_from_args, LOADING_ATTRIBUTES_CONFIG_TYPES
         ):
             loading_attr_dict = quantization_config_from_args.get_loading_attributes()
-            if isinstance(quantization_config_from_args, (BlockScaledConfig, FineGrainedConfig)):
-                ignored = _ignored_options(quantization_config, quantization_config_from_args, loading_attr_dict)
             for attr, val in loading_attr_dict.items():
                 if attr == "dtype_plan" and isinstance(quantization_config, FineGrainedConfig):
                     val = _with_activation_formats(quantization_config.dtype_plan, val)
@@ -298,20 +294,11 @@ class AutoHfQuantizer:
 
             if loading_attr_dict:
                 warning_msg += f"However, loading attributes (e.g. {list(loading_attr_dict.keys())}) will be overwritten with the one you passed to `from_pretrained`. The rest will be ignored."
-            if ignored:
-                warning_msg += f" Ignored: {ignored}."
 
-        # Passing these configs for their loading attributes is expected. Only warn when options are ignored.
-        lends_only = (
-            isinstance(
-                quantization_config,
-                (Mxfp4Config, MetalConfig, FineGrainedConfig, BlockScaledConfig, FineGrainedFP8Config),
-            )
-            and not ignored
-        )
-        if warning_msg != "" and not lends_only:
+        if warning_msg != "" and not isinstance(quantization_config, (Mxfp4Config, MetalConfig, FineGrainedFP8Config)):
             warnings.warn(warning_msg)
         else:
+            # in the case of mxfp4, we don't want to print the warning message, bit confusing for users
             logger.info(warning_msg)
         return quantization_config
 
@@ -368,52 +355,15 @@ def register_quantizer(name: str):
     return register_quantizer_fn
 
 
-def _as_json(config) -> dict:
-    """Return `config` as `config.json` stores it. A tuple then compares equal to its serialized list."""
-    return json.loads(config.to_json_string(use_diff=False))
-
-
-def _set_options(config) -> dict:
-    """Return the options `config` sets to non-default values."""
-    defaults = _as_json(type(config)())
-    return {name: value for name, value in _as_json(config).items() if defaults.get(name) != value}
-
-
-def _ignored_options(quantization_config, quantization_config_from_args, loading_attributes: dict) -> list[str]:
-    """Return the passed options that the checkpoint's config overrides.
-
-    These are options set to a non-default value that differs from the checkpoint's and is not a loading attribute.
-    A passed `dtype_plan` is checked entry by entry.
-    """
-    own, passed = _as_json(quantization_config), _set_options(quantization_config_from_args)
-    ignored = [
-        name
-        for name, value in passed.items()
-        if name not in loading_attributes and name != "quant_method" and own.get(name) != value
-    ]
-    for pattern, entry in loading_attributes.get("dtype_plan", {}).items():
-        own_entry = quantization_config.dtype_plan.get(pattern)
-        if type(own_entry) is not type(entry):
-            ignored.append(f"dtype_plan[{pattern!r}]")
-            continue
-        own_options = _as_json(own_entry)
-        ignored += [
-            f"dtype_plan[{pattern!r}].{name}"
-            for name, value in _set_options(entry).items()
-            if name != "activation_format" and own_options.get(name) != value
-        ]
-    return ignored
-
-
 def _with_activation_formats(dtype_plan: dict, passed_plan: dict) -> dict:
     """Return `dtype_plan` with the activation formats of `passed_plan`.
 
-    An entry takes the passed activation format only when the passed entry has the same pattern and format.
+    An entry takes the passed activation format when the passed entry has the same pattern and format.
     The weights stay the same. Only the kernels they run on change.
     """
     merged = dict(dtype_plan)
     for pattern, entry in passed_plan.items():
-        if type(merged.get(pattern)) is type(entry) and entry._names_activation_format:
+        if type(merged.get(pattern)) is type(entry):
             merged[pattern] = copy.copy(merged[pattern])
             merged[pattern].activation_format = entry.activation_format
             merged[pattern].post_init()

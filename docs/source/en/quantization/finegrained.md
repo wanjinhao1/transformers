@@ -45,8 +45,8 @@ weights run on. Its loading options also apply.
 - `modules_to_not_convert` replaces the checkpoint's list of modules kept in full precision. If it is unset, the
   checkpoint's list stays.
 
-The block size, scale format and activation scheme come from the checkpoint. A passed value that differs from them is
-ignored with a warning.
+The other options, such as the block size or the scale format, come from the checkpoint. Passing a config warns that
+they are ignored.
 
 ## Mix formats in one model
 

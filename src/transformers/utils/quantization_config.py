@@ -20,7 +20,7 @@ import json
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional, Union, cast
+from typing import Any, Optional, Union
 
 from packaging import version
 
@@ -1696,16 +1696,6 @@ class SpQRConfig(QuantizationConfigMixin):
             raise TypeError("shapes must be a dict")
 
 
-class _FormatDefault:
-    """Sentinel for an `activation_format` that was not passed."""
-
-    def __repr__(self):
-        return "the format's default"
-
-
-_FORMAT_DEFAULT = cast(Any, _FormatDefault())
-
-
 def _loading_attributes(config, **attributes) -> dict[str, Any]:
     """Return the loading attributes a passed config lends to a pre-quantized checkpoint's config.
 
@@ -1726,8 +1716,8 @@ class BlockScaledConfig(QuantizationConfigMixin):
     Build one of the formats.
 
     Args:
-        activation_format (`str | None`, *optional*, defaults to `the format's default`):
-            Activation format used by the quantized layers. Omit it to use the weight format's default.
+        activation_format (`str | None`, *optional*):
+            Activation format used by the quantized layers. `None` uses the weight format.
         dequantize (`bool`, *optional*, defaults to `False`):
             Whether to load a quantized checkpoint in full precision.
         modules_to_not_convert (`list | None`, *optional*):
@@ -1736,10 +1726,9 @@ class BlockScaledConfig(QuantizationConfigMixin):
             Producer layout of the checkpoint tensors: `"compressed-tensors"` or `"modelopt"`.
     """
 
-    # The `quant_method`, the activation formats the kernels support, and the default one
+    # The `quant_method` and the activation formats the kernels support
     method: QuantizationMethod
     activation_formats: tuple[str | None, ...] = (None,)
-    default_activation_format: str | None = None
     # Fixed by each format. Only FP8 takes them as options.
     weight_block_size: tuple[int, int] | None = None
     scale_fmt: str = "float"
@@ -1748,7 +1737,7 @@ class BlockScaledConfig(QuantizationConfigMixin):
     def __init__(
         self,
         *,
-        activation_format: str | None = _FORMAT_DEFAULT,
+        activation_format: str | None = None,
         dequantize: bool = False,
         modules_to_not_convert: list | None = None,
         checkpoint_format: str | None = None,
@@ -1784,11 +1773,7 @@ class BlockScaledConfig(QuantizationConfigMixin):
         if kwargs:
             logger.info(f"Unused kwargs: {list(kwargs)}. These kwargs are not used in {type(self).__name__}.")
         self.checkpoint_format = checkpoint_format
-        # A passed config overrides a checkpoint's activation format only when it names one
-        self._names_activation_format = activation_format is not _FORMAT_DEFAULT
-        self.activation_format = (
-            self.default_activation_format if activation_format is _FORMAT_DEFAULT else activation_format
-        )
+        self.activation_format = activation_format
         self.dequantize = dequantize
         self.modules_to_not_convert = modules_to_not_convert
         self.post_init()
@@ -1808,8 +1793,7 @@ class BlockScaledConfig(QuantizationConfigMixin):
             )
 
     def get_loading_attributes(self):
-        named = {"activation_format": self.activation_format} if self._names_activation_format else {}
-        return _loading_attributes(self, **named)
+        return _loading_attributes(self, activation_format=self.activation_format)
 
     def _check_activation_format(self, activation_format: str | None):
         """Raise if this checkpoint cannot run with the `activation_format` passed to `from_pretrained`."""
@@ -1822,15 +1806,9 @@ class BlockScaledConfig(QuantizationConfigMixin):
         entries = list(config.dtype_plan.values())
         if len(entries) > 1 or any(type(entry) is not type(self) for entry in entries):
             return None
-        lender = copy.copy(entries[0]) if entries else type(self)()
+        lender = copy.copy(entries[0] if entries else self)
         lender.dequantize, lender.modules_to_not_convert = config.dequantize, config.modules_to_not_convert
         return lender
-
-    def to_dict(self) -> dict[str, Any]:
-        return {name: value for name, value in super().to_dict().items() if not name.startswith("_")}
-
-    def __iter__(self):
-        yield from self.to_dict().items()
 
 
 # Block-scaled format configs by `quant_method`, to read plan entries back from `config.json`
