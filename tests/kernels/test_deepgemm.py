@@ -47,6 +47,7 @@ import transformers.integrations.deepgemm as dg
 import transformers.integrations.finegrained.layers as fg
 from transformers.integrations.deepgemm import (
     deepgemm_bf16_experts_forward,
+    deepgemm_fp8_fp4_experts_forward,
     deepgemm_fp8_fp4_linear,
     deepgemm_fp8_fp4_megamoe_experts_forward,
 )
@@ -57,7 +58,7 @@ from transformers.testing_utils import (
 )
 
 from ..integrations.finegrained.utils import fake_finegrained_kernel, patch_finegrained_kernel
-from .test_utils import make_experts
+from .test_utils import make_experts, make_fp8_experts
 
 
 def _add_one(x, *args, **kwargs):
@@ -230,13 +231,6 @@ class DeepGemmLoaderTest(unittest.TestCase):
 
         run(torch.zeros(3, device=torch_device))  # a graph break / traced probe would raise here
 
-    def test_uint8_scale_containers_use_exponents_on_both_architectures(self):
-        scales = torch.tensor([[126, 127, 128, 129]], dtype=torch.uint8).repeat(2, 1)
-        hopper = dg._coerce_sf_for_kernel(scales, is_sm100=False)
-        torch.testing.assert_close(hopper, torch.tensor([[0.5, 1.0, 2.0, 4.0]]).repeat(2, 1))
-        blackwell = dg._coerce_sf_for_kernel(scales, is_sm100=True)
-        torch.testing.assert_close(blackwell, scales.view(torch.int32))
-
     def test_to_local_is_compile_safe(self):
         # Every experts forward unwraps its weights through `to_local`, inside the traced region.
         # So the distributed availability check in `is_dtensor` must fold to a constant.
@@ -250,6 +244,13 @@ class DeepGemmLoaderTest(unittest.TestCase):
 
         out = run(torch.zeros(3, device=torch_device))  # a graph break / traced probe would raise here
         self.assertTrue(torch.equal(out, torch.ones(3, device=torch_device)))
+
+    def test_uint8_scale_containers_use_exponents_on_both_architectures(self):
+        scales = torch.tensor([[126, 127, 128, 129]], dtype=torch.uint8).repeat(2, 1)
+        hopper = dg._coerce_sf_for_kernel(scales, is_sm100=False)
+        torch.testing.assert_close(hopper, torch.tensor([[0.5, 1.0, 2.0, 4.0]]).repeat(2, 1))
+        blackwell = dg._coerce_sf_for_kernel(scales, is_sm100=True)
+        torch.testing.assert_close(blackwell, scales.view(torch.int32))
 
 
 # ── Capturing fake DeepGEMM bundle ─────────────────────────────────────────────
@@ -379,6 +380,31 @@ class DeepGemmForwardTest(unittest.TestCase):
 
     # ── deepgemm_fp8_fp4_linear ────────────────────────────────────────────────
 
+    def test_linear_fp8_sm90_kernel_inputs(self):
+        # FP8 weights + float32 block SF on SM90: recipe stays None, SFs are handed over row-major
+        # float32 (SM90 dispatch transforms SFA itself and only checks SFB — see `_coerce_sf_for_kernel`).
+        input = torch.randn(2, 3, 128, dtype=torch.bfloat16, device=torch_device)  # 3D -> flatten to (6, 128)
+        weight = torch.randn(256, 128, device=torch_device).to(torch.float8_e4m3fn)
+        weight_scale = torch.ones(2, 1, dtype=torch.float32, device=torch_device)  # (N/128, K/128)
+        with self._bundle(is_sm100=False) as captured:
+            out = deepgemm_fp8_fp4_linear(input, weight, weight_scale, block_size=(128, 128))
+
+        cast = captured["per_token_cast"][0]
+        self.assertFalse(cast["use_ue8m0"])
+        self.assertEqual(cast["gran_k"], 128)
+        self.assertEqual(cast["x"].shape, (6, 128))  # flattened to 2D
+
+        (matmul,) = captured["matmul"]
+        self.assertIsNone(matmul["recipe"])  # float-SF path leaves the recipe unset
+        (_, act_sf), (w, w_sf) = matmul["lhs"], matmul["rhs"]
+        self.assertIs(w, weight)
+        # SM90 float32 SFs pass through `_coerce_sf_for_kernel` value-exact (row-major contiguous).
+        self.assertEqual(act_sf.dtype, torch.float32)
+        self.assertEqual(w_sf.dtype, torch.float32)
+        self.assertTrue(torch.equal(w_sf, weight_scale.contiguous()))
+
+        self.assertEqual(out.shape, (2, 3, 256))  # reshaped back to input.shape[:-1] + (N,)
+
     @require_torch_greater_or_equal("2.7")  # torch.float8_e8m0fnu (UE8M0) landed in 2.7
     def test_linear_fp4_sm100_packs_ue8m0_scales(self):
         # FP4 weights (int8): SM100-only. Scales arrive UE8M0 and must reach the kernel packed into
@@ -402,6 +428,25 @@ class DeepGemmForwardTest(unittest.TestCase):
         self.assertEqual(act_sf.dtype, torch.int32)
         self.assertEqual(w_sf.dtype, torch.int32)
         self.assertEqual(w_sf.shape, (256, 1))
+
+    @require_torch_greater_or_equal("2.7")  # torch.float8_e8m0fnu (UE8M0) landed in 2.7
+    def test_assert_sm100_requirements(self):
+        # The shared before-load arch guard used by every FP8/FP4 forward: FP4 (int8) weights need
+        # Blackwell; Blackwell has no float32 scale-factor path. Driven directly (faked capability)
+        # instead of re-tested through linear / experts / megamoe.
+        fp8_w = torch.zeros(1, 1, dtype=torch.float8_e4m3fn, device=torch_device)
+        int8_w = torch.zeros(1, 1, dtype=torch.int8, device=torch_device)
+        f32_sf = torch.ones(1, 1, dtype=torch.float32, device=torch_device)
+        ue8m0_sf = f32_sf.to(torch.float8_e8m0fnu)
+        available = mock.patch.object(torch.cuda, "is_available", return_value=True)
+        with available, mock.patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)):  # SM90
+            with self.assertRaisesRegex(NotImplementedError, "Blackwell"):
+                dg._assert_sm100_requirements(int8_w, ue8m0_sf)  # FP4 has no Hopper kernel
+            dg._assert_sm100_requirements(fp8_w, f32_sf)  # float32 SF is fine on SM90 -> no raise
+        with available, mock.patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)):  # SM100
+            with self.assertRaisesRegex(NotImplementedError, "float32 scale-factor path"):
+                dg._assert_sm100_requirements(fp8_w, f32_sf)  # no float32 SF path on Blackwell
+            dg._assert_sm100_requirements(int8_w, ue8m0_sf)  # UE8M0 on SM100 -> no raise
 
     def test_linear_rejects_float32_scales_on_sm100(self):
         # Regression for #47030: rounding a checkpoint's float32 scales up to UE8M0 without requantizing
@@ -495,6 +540,32 @@ class DeepGemmForwardTest(unittest.TestCase):
         top_k_weights = torch.rand(top_k_index.shape, dtype=torch.bfloat16, device=torch_device)
         return hidden_states, top_k_index, top_k_weights
 
+    def test_fp8_experts_kernel_inputs_sm90(self):
+        experts = make_fp8_experts(num_experts=4, hidden=8, inter=16)  # FP8 weights, float32 block SFs
+        hidden_states, top_k_index, top_k_weights = self._fp8_hidden()
+        with self._bundle(is_sm100=False) as captured:
+            deepgemm_fp8_fp4_experts_forward(experts, hidden_states, top_k_index, top_k_weights)
+
+        # FP8 + float32 SF -> non-UE8M0 gran_k=128 cast, no packed recipe.
+        cast = captured["per_token_cast"][0]
+        self.assertFalse(cast["use_ue8m0"])
+        self.assertEqual(cast["gran_k"], 128)
+
+        up, down = captured["grouped"]
+        self.assertEqual(up["name"], "fp8_fp4_nt")  # non-transposed -> NT
+        self.assertIsNone(up["recipe"])
+        self.assertFalse(up["use_psum_layout"])
+        # Operands are `(qtensor, sf)` tuples; the up-proj weight/SF are the module's gate_up pair.
+        (_, act_sf), (w_up, w_up_sf) = up["lhs"], up["rhs"]
+        self.assertEqual(act_sf.dtype, torch.float32)
+        self.assertIs(w_up, experts.gate_up_proj)
+        self.assertIs(w_up_sf, experts.gate_up_proj_scale_inv)
+        # Down-proj weight/SF come from the down pair.
+        self.assertIs(down["rhs"][0], experts.down_proj)
+        self.assertIs(down["rhs"][1], experts.down_proj_scale_inv)
+        # Up-proj output buffer is (padded rows, 2I).
+        self.assertEqual(up["out"].shape[1], 32)
+
     # ── deepgemm_fp8_fp4_megamoe_experts_forward ───────────────────────────────
 
     def _make_megamoe(self, *, num_experts=4, hidden_dim=64, inter=32, swiglu_limit=None):
@@ -519,6 +590,54 @@ class DeepGemmForwardTest(unittest.TestCase):
             config=types.SimpleNamespace(swiglu_limit=swiglu_limit),
             has_post_expert_norm=False,
         )
+
+    @require_torch_greater_or_equal("2.7")  # torch.float8_e8m0fnu (UE8M0) landed in 2.7
+    def test_megamoe_transforms_weights_and_marshals_symm_buffer(self):
+        module = self._make_megamoe(num_experts=4, hidden_dim=64, inter=32, swiglu_limit=7.0)
+        num_tokens, num_top_k = 3, 2
+        hidden_states = torch.randn(num_tokens, 64, dtype=torch.bfloat16, device=torch_device)
+        top_k_index = torch.randint(0, 4, (num_tokens, num_top_k), dtype=torch.long, device=torch_device)
+        top_k_weights = torch.rand(num_tokens, num_top_k, dtype=torch.float32, device=torch_device)
+        pg = types.SimpleNamespace(size=lambda: 2)
+
+        with self._bundle(is_sm100=True) as captured:
+            deepgemm_fp8_fp4_megamoe_experts_forward(
+                module, hidden_states, top_k_index, top_k_weights, process_group=pg
+            )
+
+        # setup_megamoe_weights: SFs transformed with the UTCCP recipe (1, 32) at the right dims.
+        gate_up_sf_call, down_sf_call = captured["transform_sf"]
+        self.assertEqual(gate_up_sf_call["dim_a"], 2 * 32)  # 2 * intermediate
+        self.assertEqual(gate_up_sf_call["dim_b"], 64)  # hidden_dim
+        self.assertEqual(gate_up_sf_call["recipe"], (1, 32))
+        self.assertEqual(gate_up_sf_call["num_groups"], 4)  # num_local_experts
+        self.assertEqual(down_sf_call["dim_a"], 64)
+        self.assertEqual(down_sf_call["dim_b"], 32)
+
+        # The module weights were overwritten in place with the transform_weights_for_mega_moe output,
+        # and those exact transformed tensors reach the kernel.
+        (new_gate_up, _), (new_down, _) = captured["transform_weights_out"]
+        self.assertTrue(torch.equal(module.gate_up_proj.data, new_gate_up))
+        self.assertTrue(torch.equal(module.down_proj.data, new_down))
+        self.assertTrue(self._megamoe_flag_set(module))
+
+        # Symm buffer sized from global expert count (num_local * process_group.size()).
+        self.assertEqual(captured["symm_buffer_kwargs"]["num_experts"], 4 * 2)
+
+        # Hidden states cast FP8/UE8M0 (gran_k=32 packed) and staged into the symm buffer.
+        cast = captured["per_token_cast"][0]
+        self.assertTrue(cast["use_ue8m0"] and cast["use_packed_ue8m0"])
+        self.assertEqual(cast["gran_k"], 32)
+        buf = captured["symm_buffer"]
+        self.assertTrue(torch.equal(buf.topk_idx[:num_tokens], top_k_index))
+        self.assertTrue(torch.allclose(buf.topk_weights[:num_tokens], top_k_weights))
+
+        # Kernel receives the transformed L1/L2 weight pairs and the SwiGLU clamp from config.
+        mega = captured["mega_moe"]
+        self.assertIs(mega["gate_up_pair"][0], module.gate_up_proj)
+        self.assertIs(mega["down_pair"][0], module.down_proj)
+        self.assertIs(mega["symm_buffer"], buf)
+        self.assertEqual(mega["activation_clamp"], 7.0)
 
     @require_torch_greater_or_equal("2.7")  # torch.float8_e8m0fnu (UE8M0) landed in 2.7
     def test_megamoe_requires_fp4_weights_and_process_group(self):

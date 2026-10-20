@@ -11,13 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared format specs and fast quantizer contract tests.
+"""Shared format specs and fast quantizer contract tests."""
 
-Real-checkpoint tests live in `block_scaled_checkpoint_tester.py`.
-Distributed loading and compiled decode tests live in `block_scaled_parallel_tester.py`.
-"""
-
-import os
 import re
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager
@@ -38,16 +33,6 @@ from transformers.testing_utils import (
 )
 
 from ..integrations.finegrained.utils import _Cfg, _conversion_model, _model_mapping, _quantizer_for
-
-
-def _cheap_tuning():
-    """Use the fast autotune config so correctness tests measure a single configuration."""
-    return mock.patch.dict(
-        os.environ,
-        {
-            "FINEGRAINED_AUTOTUNE_CONFIG": "fast",
-        },
-    )
 
 
 @dataclass(frozen=True)
