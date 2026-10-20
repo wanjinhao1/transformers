@@ -115,11 +115,10 @@ class FineGrainedLayoutOpsTest(unittest.TestCase):
         _, experts = self._experts("mxfp4", activation_format="bf16")
         self.assertEqual(experts.gate_up_proj_scale_inv.dtype, torch.float8_e8m0fnu)
 
-    def test_affine_off_sm100_weight_only_deepgemm_and_block_fp8(self):
+    def test_affine_off_sm100_and_weight_only(self):
         for kw in (
             {"weight_format": "mxfp8", "sm100": False},
             {"weight_format": "mxfp4", "activation_format": "bf16"},  # W4A16 reads scales per group affinely
-            {"weight_format": "mxfp8", "impl": "deepgemm"},  # the DeepGEMM backends read affine scales
         ):
             with self.subTest(**kw):
                 _, experts = self._experts(**kw)
@@ -263,13 +262,14 @@ class FineGrainedLayoutOpsTest(unittest.TestCase):
         self.assertIs(op.convert({key: stacked}, model=model, full_layer_name=key)[key], stacked)
 
     def test_interleave_op_stacks_an_interleaved_checkpoint_for_stacked_experts(self):
-        """Check that an interleaved checkpoint is stacked on load for DeepGEMM and interleaved back on save."""
+        """Check that stacked experts stack an interleaved checkpoint on load and interleave it back on save."""
         from transformers.integrations.finegrained.conversions import FineGrainedInterleaveGateUp
 
         stacked = torch.arange(2 * 6 * 4, dtype=torch.float32).reshape(2, 6, 4)
         interleaved = stacked[:, [0, 3, 1, 4, 2, 5]]
-        model, experts = self._experts("mxfp8", impl="deepgemm")
-        experts.is_concatenated = False
+        model, experts = self._experts("mxfp8")
+        # block-FP8 experts off SM100 hold gate|up stacked
+        experts.is_concatenated, experts.holds_interleaved_gate_up = False, False
         op = FineGrainedInterleaveGateUp(hf_quantizer=None)
         key = "experts.gate_up_proj"
         loaded = op.convert({key: interleaved}, model=model, full_layer_name=key)[key]
