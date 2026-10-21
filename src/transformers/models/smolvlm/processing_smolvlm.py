@@ -258,12 +258,10 @@ class SmolVLMProcessor(ProcessorMixin):
             chat_template = DEFAULT_CHAT_TEMPLATE
 
         # Users might be passing processor kwargs simply as `**kwargs`
-        if processor_kwargs:
-            processor_kwargs.setdefault("num_frames", self.video_processor.num_frames)
-            processor_kwargs.setdefault("fps", self.video_processor.fps)
-        else:
-            kwargs.setdefault("num_frames", self.video_processor.num_frames)
-            kwargs.setdefault("fps", self.video_processor.fps)
+        if processor_kwargs is None:
+            processor_kwargs = {}
+        processor_kwargs.setdefault("num_frames", self.video_processor.num_frames)
+        processor_kwargs.setdefault("fps", self.video_processor.fps)
 
         return super().apply_chat_template(conversation, chat_template, processor_kwargs=processor_kwargs, **kwargs)
 

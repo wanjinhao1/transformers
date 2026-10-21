@@ -535,6 +535,17 @@ class SmolVLMProcessorTest(ProcessorTesterMixin, unittest.TestCase):
                 max_length=20,
             )
 
+    @require_torch
+    @require_vision
+    def test_apply_chat_template_no_spurious_kwarg_warning(self):
+        # Regression test for https://github.com/huggingface/transformers/issues/49761
+        # `num_frames`/`fps` defaults are injected into `processor_kwargs`, not `**kwargs`,
+        # so no warning should be logged when the user passes no extra kwargs.
+        messages = [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}]
+        processor = self.get_processor()
+        with self.assertNoLogs("transformers.processing_utils", level="WARNING"):
+            processor.apply_chat_template(messages, add_generation_prompt=True)
+
     @unittest.skip(
         "SmolVLM cannot accept list of decoded video frames, because it needs to know video fps and duration"
     )
